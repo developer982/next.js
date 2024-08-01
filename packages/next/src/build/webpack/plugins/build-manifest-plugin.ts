@@ -273,13 +273,84 @@ export default class BuildManifestPlugin {
         if (SYSTEM_ENTRYPOINTS.has(entrypoint.name)) continue
         const pagePath = getRouteFromEntrypoint(entrypoint.name)
 
-        if (!pagePath) {
-          continue
-        }
+        if (!pagePath) continue
 
         const filesForPage = getEntrypointFiles(entrypoint)
-
         assetMap.pages[pagePath] = [...new Set([...mainFiles, ...filesForPage])]
+      }
+
+      // When a CSS file is server-rendered, it is cleaned up during
+      // Link transitions. If the target route dynamically imports
+      // the same CSS file, the client will skip loading it
+      // (as it was already loaded statically), but still clean it up
+      // during transition. This can result in missing CSS styles.
+      // x-ref: `next/src/client/index.tsx`
+
+      // 1. page transition
+      // 2. import (CSS already exists)
+      // 3. clean up server-rendered CSS
+      // 4. CSS is missing
+
+      // To prevent this, we add the dynamically imported CSS files
+      // to the build manifest to signal the client not to clean up
+      // the CSS file if it's loaded dynamically, preserving the styles.
+
+      /* Inspired by `next/src/build/webpack/react-loadable-plugin.ts` */
+      const _handleBlock = (block: any) => {
+        block.blocks.forEach(_handleBlock)
+
+        const dynamicCSSFiles = new Set<string>()
+
+        const chunkGroup = compilation.chunkGraph.getBlockChunkGroup(block)
+        if (chunkGroup) {
+          for (const chunk of chunkGroup.chunks) {
+            chunk.files.forEach((file: string) => {
+              if (file.endsWith('.css') && file.match(/^static\/css\//)) {
+                dynamicCSSFiles.add(file)
+              }
+            })
+          }
+        }
+
+        for (const dependency of block.dependencies) {
+          // We target the two types of dynamic import() dependencies:
+          // `ImportDependency` and `ContextElementDependency`.
+
+          // ImportDependency:
+          // - syntax: import("./module")
+          // - dependency.type: "import()"
+
+          // ContextElementDependency:
+          // - syntax: import(`./module/${param}`)
+          // - dependency.type: "import() context element"
+          if (dependency.type.startsWith('import()')) {
+            const parentModule =
+              compilation.moduleGraph.getParentModule(dependency)
+
+            const parentChunks =
+              compilation.chunkGraph.getModuleChunks(parentModule)
+
+            for (const chunk of parentChunks) {
+              const chunkName = chunk.name
+              if (!chunkName || !chunkName.startsWith('pages')) continue
+
+              const pagePath = getRouteFromEntrypoint(chunkName)
+              if (!pagePath) continue
+
+              const assetMapPages = assetMap.pages[pagePath]
+              // We should already have `assetMapPages` from the `entrypoint`.
+              if (!assetMapPages) continue
+
+              assetMap.pages[pagePath] = [
+                ...new Set([...assetMapPages, ...dynamicCSSFiles]),
+              ]
+            }
+          }
+        }
+      }
+
+      for (const module of compilation.modules) {
+        module.blocks.forEach(_handleBlock)
       }
 
       if (!this.isDevFallback) {
